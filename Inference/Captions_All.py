@@ -8,6 +8,7 @@ Remote-sensing caption batcher with GLM/Qwen (OpenAI-compatible) backends.
 - Sends single/multi images in one user message
 - Robust JSON extraction and retry
 - Checkpoint/resume via JSONL
+- Multi-threaded concurrent API requests for speed
 All comments are in English as requested.
 """
 
@@ -18,9 +19,12 @@ import os
 import re
 import time
 import tempfile
+import threading
 from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 
 import numpy as np
 import requests
@@ -42,7 +46,11 @@ DEFAULT_MAX_BYTES = 0
 DEFAULT_MAX_PIXELS = 0
 DEFAULT_API_TIMEOUT = 180
 DEFAULT_MAX_RETRIES = 5
+DEFAULT_MAX_WORKERS = 4  # New: default concurrent workers
 HEADERS = {"Content-Type": "application/json"}
+
+# Thread-safe write lock
+write_lock = threading.Lock()
 
 # =========================
 # Prompt helpers
@@ -328,9 +336,10 @@ def call_openai_compatible(
     max_tokens: int,
     json_mode: bool,
     timeout: int = DEFAULT_API_TIMEOUT,
+    transport: str = "file",
 ) -> Dict[str, Any]:
     """Single entry for GLM/Qwen (OpenAI-compatible) backends."""
-    content = [{"type": "text", "text": user_prompt}] + [_image_part_from_path(p, call_openai_compatible.transport) for p in images]
+    content = [{"type": "text", "text": user_prompt}] + [_image_part_from_path(p, transport) for p in images]
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
@@ -356,13 +365,120 @@ def call_openai_compatible(
     parsed = robust_parse_json(content)
     return {"elapsed_sec": dt, "raw_text": content, "json": parsed}
 
-# little trick to pass transport without changing signature
-call_openai_compatible.transport = "file"  # will be overwritten at runtime
+# =========================
+# Task definition for worker threads
+# =========================
+class ProcessingTask:
+    def __init__(self, idx: int, img_path: Path, file_subdir: Path, 
+                 panels_info: List[Tuple[str, Path]], send_paths: List[Path], 
+                 use_single_path: Optional[Path], ow: int, oh: int, iw: int, ih: int, 
+                 mae_value: float, user_prompt: str):
+        self.idx = idx
+        self.img_path = img_path
+        self.file_subdir = file_subdir
+        self.panels_info = panels_info
+        self.send_paths = send_paths
+        self.use_single_path = use_single_path
+        self.ow = ow
+        self.oh = oh
+        self.iw = iw
+        self.ih = ih
+        self.mae_value = mae_value
+        self.user_prompt = user_prompt
 
 # =========================
-# Processing loop (single implementation for temp/persistent)
+# Worker function for concurrent processing
 # =========================
-def _process_stream(
+def process_single_image(
+    task: ProcessingTask,
+    api_url: str,
+    model: str,
+    system_prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    json_mode: bool,
+    transport: str,
+    max_retries: int,
+    verbose: bool,
+    detail: bool,
+    total_files: int,
+) -> Dict[str, Any]:
+    """Process a single image task and return the result record."""
+    
+    # Retry wrapper
+    retry = 0
+    result = None
+    while retry <= max_retries:
+        send = task.send_paths if task.panels_info else [task.use_single_path]  # type: ignore
+        out = call_openai_compatible(
+            api_url=api_url,
+            model=model,
+            images=send,
+            system_prompt=system_prompt,
+            user_prompt=task.user_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            transport=transport,
+        )
+        if out.get("json") is not None:
+            result = out
+            break
+        retry += 1
+        if retry <= max_retries:
+            print(f"[RETRY {retry}/{max_retries}] Null JSON, retrying {task.img_path.name}...")
+        else:
+            result = out
+            print(f"[FAILED] Max retries reached for {task.img_path.name}")
+
+    if verbose and result.get("raw_text"):
+        print(f"[RAW] {'-'*40}\n{result['raw_text']}\n{'-'*40}")
+
+    record: Dict[str, Any] = {
+        "image_path": str(task.img_path),
+        "orig_size": {"w": task.ow, "h": task.oh},
+        "infer_size": {"w": task.iw, "h": task.ih},
+        "high_freq_restore_diff": task.mae_value,
+        "elapsed_sec": result.get("elapsed_sec", None),
+        "retry_count": retry,
+        "panels": [{"label": lbl, "path": str(p)} for (lbl, p) in task.panels_info] if task.panels_info else None,
+        "output": {
+            "global_caption": result.get("json", {}).get("global_caption", ""),
+            "event_analysis": result.get("json", {}).get("event_analysis", ""),
+            "spatial_attributes": result.get("json", {}).get("spatial_attributes", ""),
+            "spectral_features": result.get("json", {}).get("spectral_features", ""),
+            "task_relevance": result.get("json", {}).get("task_relevance", "")
+        } if result.get("json") else None
+    }
+
+    if detail and result.get("raw_text"):
+        record["raw_text"] = result["raw_text"]
+    if "error_text" in result:
+        record["error"] = result.get("error_text", None)
+    
+    # Progress reporting
+    progress = (task.idx / total_files * 100) if total_files > 0 else 0
+    required_keys = ["global_caption", "event_analysis", "spatial_attributes", "spectral_features", "task_relevance"]
+    
+    # start time to time
+    elapsed_time = time.time() - getattr(process_single_image, 'start_time', time.time())
+    
+    # format progress
+    print(f"[{task.idx:06d}/{progress:.1f}%/{elapsed_time:.1f}s] {task.img_path.name}\t{record['elapsed_sec']:.2f}s", end="\t")
+    if record["output"] is None:
+        print("[MISS] All output keys")
+    else:
+        miss = [k for k in required_keys if not record["output"].get(k)]
+        print("[OK] All output keys present" if not miss else f"[MISS] {', '.join(miss)}")
+
+    return record
+
+# =========================
+# Processing loop with concurrency
+# =========================
+def _process_stream_concurrent(
     stream: Iterable[Path],
     total_files: int,
     tmp_root: Path,
@@ -388,177 +504,167 @@ def _process_stream(
     max_panels: int,
     processed: set,
     json_mode: bool,
+    transport: str,
+    max_workers: int,
 ) -> Tuple[int, int]:
-    """Core loop used for both temp and persistent modes."""
+    """Core concurrent processing loop."""
     total_seen = 0
     total_emitted = 0
-    required_keys = ["global_caption", "event_analysis", "spatial_attributes", "spectral_features", "task_relevance"]
+    
+    # Process tasks concurrently with streaming approach
+    with open(out_jsonl, "a", encoding="utf-8") as fout:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Use a queue to limit the number of pending futures
+            future_queue = set()
+            
+            for idx, img_path in enumerate(stream, 1):
+                if str(img_path.resolve()) in processed:
+                    print(f"[SKIP] Already processed: {img_path.name}")
+                    continue
+                total_seen += 1
 
-    with out_jsonl.open("a", encoding="utf-8") as fout:
-        for idx, img_path in enumerate(stream, 1):
-            if str(img_path.resolve()) in processed:
-                print(f"[SKIP] Already processed: {img_path.name}")
-                continue
-            total_seen += 1
+                if file_too_large(img_path, max_bytes):
+                    print(f"[SKIP] Too large (>max-bytes): {img_path.name}")
+                    continue
+                if image_too_many_pixels(img_path, max_pixels):
+                    print(f"[SKIP] Too many pixels (>max-pixels): {img_path.name}")
+                    continue
 
-            if file_too_large(img_path, max_bytes):
-                print(f"[SKIP] Too large (>max-bytes): {img_path.name}")
-                continue
-            if image_too_many_pixels(img_path, max_pixels):
-                print(f"[SKIP] Too many pixels (>max-pixels): {img_path.name}")
-                continue
-
-            try:
-                panels_info: List[Tuple[str, Path]] = []
-                send_paths: List[Path] = []
-                ow = oh = iw = ih = None  # type: Optional[int]
-                mae_value = -1.0
-                use_single_path: Optional[Path] = None
-
-                # Try loading to detect multichannel HSI
                 try:
-                    arr = _load_array_from_path(img_path)
-                except Exception:
-                    arr = None
-                is_multi_channel = (arr is not None and arr.ndim == 3 and arr.shape[2] > 3)
+                    panels_info: List[Tuple[str, Path]] = []
+                    send_paths: List[Path] = []
+                    ow = oh = iw = ih = None  # type: Optional[int]
+                    mae_value = -1.0
+                    use_single_path: Optional[Path] = None
 
-                # Create a per-file subdir (keeps artifacts tidy)
-                file_subdir = tmp_root / img_path.stem
-                file_subdir.mkdir(parents=True, exist_ok=True)
+                    # Try loading to detect multichannel HSI
+                    try:
+                        arr = _load_array_from_path(img_path)
+                    except Exception:
+                        arr = None
+                    is_multi_channel = (arr is not None and arr.ndim == 3 and arr.shape[2] > 3)
 
-                if hsi_panels and is_multi_channel:
-                    panels = _mk_panels_from_hsi(arr, hsi_triplets, band_indexing, clip_percent, max_panels)
-                    if len(panels) == 0:
+                    # Create a per-file subdir (keeps artifacts tidy)
+                    file_subdir = tmp_root / img_path.stem
+                    file_subdir.mkdir(parents=True, exist_ok=True)
+
+                    if hsi_panels and is_multi_channel:
+                        panels = _mk_panels_from_hsi(arr, hsi_triplets, band_indexing, clip_percent, max_panels)
+                        if len(panels) == 0:
+                            use_path, (ow, oh), (iw, ih) = save_resized_if_needed(img_path, max_side, file_subdir)
+                            use_single_path = use_path
+                        else:
+                            H, W, _ = arr.shape
+                            ow, oh = W, H
+                            for label, rgb in panels:
+                                png = _write_temp_png(rgb, file_subdir, img_path.stem, label)
+                                use_path, (_ow2, _oh2), (riw, rih) = save_resized_if_needed(png, max_side, file_subdir)
+                                send_paths.append(use_path)
+                                panels_info.append((label, use_path))
+                            if send_paths:
+                                try:
+                                    # Use first panel for the fast MAE proxy
+                                    gray_mae_src = send_paths[0]
+                                    img_gray = cv2.imread(str(gray_mae_src), cv2.IMREAD_GRAYSCALE)
+                                    dft = cv2.dft(np.float32(img_gray), flags=cv2.DFT_COMPLEX_OUTPUT)
+                                    rows, cols = img_gray.shape
+                                    crow, ccol = rows // 2, cols // 2
+                                    mask = np.zeros((rows, cols, 2), np.uint8)
+                                    radius = int(min(rows, cols) * 0.5)
+                                    cv2.circle(mask, (ccol, crow), radius, (1, 1), -1)
+                                    filtered = dft * mask
+                                    back = cv2.idft(filtered, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+                                    mae_value = float(np.mean(np.abs(img_gray - back)))
+                                except Exception:
+                                    mae_value = -1.0
+                                iw, ih = load_image_size(send_paths[0])
+                    else:
                         use_path, (ow, oh), (iw, ih) = save_resized_if_needed(img_path, max_side, file_subdir)
                         use_single_path = use_path
-                    else:
-                        H, W, _ = arr.shape
-                        ow, oh = W, H
-                        for label, rgb in panels:
-                            png = _write_temp_png(rgb, file_subdir, img_path.stem, label)
-                            use_path, (_ow2, _oh2), (riw, rih) = save_resized_if_needed(png, max_side, file_subdir)
-                            send_paths.append(use_path)
-                            panels_info.append((label, use_path))
-                        if send_paths:
-                            try:
-                                # Use first panel for the fast MAE proxy
-                                gray_mae_src = send_paths[0]
-                                img_gray = cv2.imread(str(gray_mae_src), cv2.IMREAD_GRAYSCALE)
-                                dft = cv2.dft(np.float32(img_gray), flags=cv2.DFT_COMPLEX_OUTPUT)
-                                rows, cols = img_gray.shape
-                                crow, ccol = rows // 2, cols // 2
-                                mask = np.zeros((rows, cols, 2), np.uint8)
-                                radius = int(min(rows, cols) * 0.5)
-                                cv2.circle(mask, (ccol, crow), radius, (1, 1), -1)
-                                filtered = dft * mask
-                                back = cv2.idft(filtered, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
-                                mae_value = float(np.mean(np.abs(img_gray - back)))
-                            except Exception:
-                                mae_value = -1.0
-                            iw, ih = load_image_size(send_paths[0])
-                else:
-                    use_path, (ow, oh), (iw, ih) = save_resized_if_needed(img_path, max_side, file_subdir)
-                    use_single_path = use_path
-                    try:
-                        img_gray = cv2.imread(str(use_single_path), cv2.IMREAD_GRAYSCALE)
-                        dft = cv2.dft(np.float32(img_gray), flags=cv2.DFT_COMPLEX_OUTPUT)
-                        rows, cols = img_gray.shape
-                        crow, ccol = rows // 2, cols // 2
-                        mask = np.zeros((rows, cols, 2), np.uint8)
-                        radius = int(min(rows, cols) * 0.5)
-                        cv2.circle(mask, (ccol, crow), radius, (1, 1), -1)
-                        filtered = dft * mask
-                        back = cv2.idft(filtered, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
-                        mae_value = float(np.mean(np.abs(img_gray - back)))
-                    except Exception:
-                        mae_value = -1.0
+                        try:
+                            img_gray = cv2.imread(str(use_single_path), cv2.IMREAD_GRAYSCALE)
+                            dft = cv2.dft(np.float32(img_gray), flags=cv2.DFT_COMPLEX_OUTPUT)
+                            rows, cols = img_gray.shape
+                            crow, ccol = rows // 2, cols // 2
+                            mask = np.zeros((rows, cols, 2), np.uint8)
+                            radius = int(min(rows, cols) * 0.5)
+                            cv2.circle(mask, (ccol, crow), radius, (1, 1), -1)
+                            filtered = dft * mask
+                            back = cv2.idft(filtered, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+                            mae_value = float(np.mean(np.abs(img_gray - back)))
+                        except Exception:
+                            mae_value = -1.0
 
-                if None in (ow, oh, iw, ih):
-                    if arr is not None and arr.ndim >= 2:
-                        _w, _h = arr.shape[1], arr.shape[0]
-                    else:
-                        _w, _h = load_image_size(img_path)
-                    ow, oh, iw, ih = _w, _h, _w, _h
+                    if None in (ow, oh, iw, ih):
+                        if arr is not None and arr.ndim >= 2:
+                            _w, _h = arr.shape[1], arr.shape[0]
+                        else:
+                            _w, _h = load_image_size(img_path)
+                        ow, oh, iw, ih = _w, _h, _w, _h
 
-                panel_lines = ""
-                if panels_info:
-                    panel_lines = "Panels:\n" + "\n".join([f"- {i+1}. {lbl} -> {p.name}" for i, (lbl, p) in enumerate(panels_info)]) + "\n"
+                    panel_lines = ""
+                    if panels_info:
+                        panel_lines = "Panels:\n" + "\n".join([f"- {i+1}. {lbl} -> {p.name}" for i, (lbl, p) in enumerate(panels_info)]) + "\n"
 
-                user_prompt = (
-                    f"{panel_lines}"
-                    f"Image original size: {ow}x{oh} pixels, resized to: {iw}x{ih} pixels\n"
-                    f"High frequency restoration difficulty: {mae_value:.2f} (use this to adapt detail level)\n"
-                    + user_prompt_template.format(orig_w=ow, orig_h=oh, inf_w=iw, inf_h=ih)
-                )
-
-                # Retry wrapper
-                retry = 0
-                result = None
-                while retry <= max_retries:
-                    send = send_paths if panels_info else [use_single_path]  # type: ignore
-                    out = call_openai_compatible(
-                        api_url=api_url,
-                        model=model,
-                        images=send,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        json_mode=json_mode,
+                    user_prompt = (
+                        f"{panel_lines}"
+                        f"Image original size: {ow}x{oh} pixels, resized to: {iw}x{ih} pixels\n"
+                        f"High frequency restoration difficulty: {mae_value:.2f} (use this to adapt detail level)\n"
+                        + user_prompt_template.format(orig_w=ow, orig_h=oh, inf_w=iw, inf_h=ih)
                     )
-                    if out.get("json") is not None:
-                        result = out
-                        break
-                    retry += 1
-                    if retry <= max_retries:
-                        print(f"[RETRY {retry}/{max_retries}] Null JSON, retrying {img_path.name}...")
-                    else:
-                        result = out
-                        print(f"[FAILED] Max retries reached for {img_path.name}")
 
-                if verbose and result.get("raw_text"):
-                    print(f"[RAW] {'-'*40}\n{result['raw_text']}\n{'-'*40}")
+                    # Create task
+                    task = ProcessingTask(
+                        idx, img_path, file_subdir, panels_info, send_paths, 
+                        use_single_path, ow, oh, iw, ih, mae_value, user_prompt
+                    )
 
-                record: Dict[str, Any] = {
-                    "image_path": str(img_path),
-                    "orig_size": {"w": ow, "h": oh},
-                    "infer_size": {"w": iw, "h": ih},
-                    "high_freq_restore_diff": mae_value,
-                    "elapsed_sec": result.get("elapsed_sec", None),
-                    "retry_count": retry,
-                    "panels": [{"label": lbl, "path": str(p)} for (lbl, p) in panels_info] if panels_info else None,
-                    "output": {
-                        "global_caption": result.get("json", {}).get("global_caption", ""),
-                        "event_analysis": result.get("json", {}).get("event_analysis", ""),
-                        "spatial_attributes": result.get("json", {}).get("spatial_attributes", ""),
-                        "spectral_features": result.get("json", {}).get("spectral_features", ""),
-                        "task_relevance": result.get("json", {}).get("task_relevance", "")
-                    } if result.get("json") else None
-                }
+                    # Submit task to executor immediately
+                    future = executor.submit(
+                        process_single_image,
+                        task, api_url, model, system_prompt, temperature, top_p,
+                        max_tokens, json_mode, transport, max_retries, verbose,
+                        detail, total_files
+                    )
+                    future_queue.add(future)
 
-                if detail and result.get("raw_text"):
-                    record["raw_text"] = result["raw_text"]
-                if "error_text" in result:
-                    record["error"] = result.get("error_text", None)
+                    # Remove completed futures and process results
+                    completed = {f for f in future_queue if f.done()}
+                    for future in completed:
+                        future_queue.remove(future)
+                        try:
+                            record = future.result()
+                            # Thread-safe write to file
+                            with write_lock:
+                                fout.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+                                fout.flush()
+                            total_emitted += 1
+                        except Exception as e:
+                            print(f"[ERROR] Processing {img_path.name}: {e}")
+                            # Write error record
+                            fallback = {"image_path": str(img_path), "error": f"exception: {repr(e)}"}
+                            with write_lock:
+                                fout.write(json.dumps(fallback, ensure_ascii=False) + "\n")
+                                fout.flush()
+                except UnidentifiedImageError:
+                    print(f"[SKIP] Invalid/corrupted image: {img_path.name}")
+                except Exception as e:
+                    print(f"[ERROR] {img_path.name}: {e}")
 
-                progress = (idx / total_files * 100) if total_files > 0 else 0
-                print(f"[{idx:06d}/{progress:.6f}%]{img_path.name}\t{record['elapsed_sec']:.2f}s", end="\t")
-                if record["output"] is None:
-                    print("[MISS] All output keys")
-                else:
-                    miss = [k for k in required_keys if not record["output"].get(k)]
-                    print("[OK] All output keys present" if not miss else f"[MISS] {', '.join(miss)}")
-
-                fout.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-                total_emitted += 1
-
-            except UnidentifiedImageError:
-                print(f"[SKIP] Invalid/corrupted image: {img_path}")
-            except Exception as e:
-                print(f"[ERROR] {img_path.name}: {e}")
-                fallback = {"image_path": str(img_path), "error": f"exception: {repr(e)}"}
-                fout.write(json.dumps(fallback, ensure_ascii=False) + "\n")
+            # Process any remaining futures
+            for future in as_completed(future_queue):
+                try:
+                    record = future.result()
+                    with write_lock:
+                        fout.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+                        fout.flush()
+                    total_emitted += 1
+                except Exception as e:
+                    # Get task info from the exception if possible
+                    print(f"[ERROR] Processing remaining task: {e}")
+                    with write_lock:
+                        fout.write(json.dumps({"error": f"exception: {repr(e)}"}, ensure_ascii=False) + "\n")
+                        fout.flush()
 
     return total_seen, total_emitted
 
@@ -585,6 +691,10 @@ def main():
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    
+    # parallel
+    ap.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
+                    help="Maximum number of concurrent API workers (default: 4)")
 
     # Backend & transport
     ap.add_argument("--backend", type=str, choices=["glm", "qwen"], default="glm",
@@ -621,7 +731,7 @@ def main():
                  for x in args.exts.split(",") if x.strip())
     prompts_path = Path(args.prompts).expanduser().resolve()
     system_prompt, user_prompt_template = load_prompts(prompts_path, args.prompt_name)
-
+    
     # Count total files (with limit awareness)
     def count_files_fast(folder: Path, exts: Tuple[str, ...]) -> int:
         cnt, ex = 0, {e.lower() for e in exts}
@@ -630,6 +740,10 @@ def main():
                 if any(f.lower().endswith(s) for s in ex):
                     cnt += 1
         return cnt
+    
+    # add time record
+    process_single_image.start_time = time.time()
+    
     total_files = args.limit if args.limit and args.limit > 0 else count_files_fast(folder, exts)
     print(f"[INFO] Total files to process: {total_files}")
 
@@ -637,9 +751,7 @@ def main():
     processed = load_processed_paths(out_path) if out_path.exists() else set()
     mode = "append" if processed else "create"
     print(f"[INFO] Results file mode: {mode}, already processed: {len(processed)}")
-
-    # Set transport for caller (shared state to avoid changing signature)
-    call_openai_compatible.transport = args.image_transport
+    print(f"[INFO] Using {args.max_workers} concurrent workers for API requests")
 
     # Build stream
     stream: Iterable[Path] = iter_images_stream(folder, exts)
@@ -651,7 +763,7 @@ def main():
         tmp_root = Path(args.keep_panels_dir).expanduser().resolve()
         tmp_root.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using persistent dir: {tmp_root}")
-        seen, emitted = _process_stream(
+        seen, emitted = _process_stream_concurrent(
             stream, total_files, tmp_root,
             api_url=args.url, model=args.model, max_side=args.max_side, out_jsonl=out_path,
             temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens,
@@ -661,12 +773,13 @@ def main():
             hsi_panels=args.hsi_panels, hsi_triplets=args.hsi_triplets,
             band_indexing=args.band_indexing, clip_percent=args.clip_percent,
             max_panels=args.max_panels, processed=processed, json_mode=args.json_mode,
+            transport=args.image_transport, max_workers=args.max_workers,
         )
     else:
         with tempfile.TemporaryDirectory(prefix="rs_caption_tmp_") as td:
             tmp_root = Path(td)
             print(f"[INFO] Using temp dir: {tmp_root}")
-            seen, emitted = _process_stream(
+            seen, emitted = _process_stream_concurrent(
                 stream, total_files, tmp_root,
                 api_url=args.url, model=args.model, max_side=args.max_side, out_jsonl=out_path,
                 temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens,
@@ -676,9 +789,12 @@ def main():
                 hsi_panels=args.hsi_panels, hsi_triplets=args.hsi_triplets,
                 band_indexing=args.band_indexing, clip_percent=args.clip_percent,
                 max_panels=args.max_panels, processed=processed, json_mode=args.json_mode,
+                transport=args.image_transport, max_workers=args.max_workers,
             )
 
     print(f"[DONE] Scanned {seen}, wrote {emitted} -> {out_path}")
 
 if __name__ == "__main__":
     main()
+
+
