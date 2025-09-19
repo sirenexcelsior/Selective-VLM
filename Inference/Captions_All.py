@@ -30,6 +30,106 @@ import numpy as np
 import requests
 import cv2
 from PIL import Image, UnidentifiedImageError
+import pandas as pd
+from PyPDF2 import PdfReader
+from docx import Document
+
+# =========================
+# Document processing utilities
+# =========================
+def extract_pdf_content(pdf_path: Path, max_pages: int = 50) -> str:
+    """提取PDF文本内容，限制页数避免过长"""
+    try:
+        reader = PdfReader(pdf_path)
+        content = ""
+        total_pages = min(len(reader.pages), max_pages)
+        for i in range(total_pages):
+            page_text = reader.pages[i].extract_text()
+            content += f"\n--- 第{i+1}页 ---\n{page_text}"
+        if len(reader.pages) > max_pages:
+            content += f"\n\n[注: 文档共{len(reader.pages)}页，仅显示前{max_pages}页]"
+        return content
+    except Exception as e:
+        return f"PDF读取错误: {str(e)}"
+
+def extract_csv_content(csv_path: Path, max_rows: int = 200) -> str:
+    """提取CSV内容，包含统计信息"""
+    try:
+        df = pd.read_csv(csv_path)
+        content = f"CSV文件统计信息:\n"
+        content += f"- 行数: {len(df)}\n"
+        content += f"- 列数: {len(df.columns)}\n"
+        content += f"- 列名: {', '.join(df.columns.tolist())}\n\n"
+        
+        if len(df) > max_rows:
+            content += f"数据预览 (前{max_rows}行):\n"
+            content += df.head(max_rows).to_string(index=False)
+            content += f"\n\n数据统计摘要:\n{df.describe().to_string()}"
+        else:
+            content += f"完整数据:\n{df.to_string(index=False)}"
+        
+        return content
+    except Exception as e:
+        return f"CSV读取错误: {str(e)}"
+
+def extract_txt_content(txt_path: Path, max_chars: int = 10000) -> str:
+    """提取TXT文本内容"""
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if len(content) > max_chars:
+            content = content[:max_chars] + f"\n\n[注: 文档已截断，原长度{len(content)}字符]"
+        return content
+    except Exception as e:
+        return f"TXT读取错误: {str(e)}"
+
+def extract_docx_content(docx_path: Path, max_paragraphs: int = 100) -> str:
+    """提取DOCX文档内容"""
+    try:
+        doc = Document(docx_path)
+        content = ""
+        for i, para in enumerate(doc.paragraphs):
+            if i >= max_paragraphs:
+                content += f"\n\n[注: 文档共{len(doc.paragraphs)}段，仅显示前{max_paragraphs}段]"
+                break
+            content += para.text + "\n"
+        return content
+    except Exception as e:
+        return f"DOCX读取错误: {str(e)}"
+
+def process_reference_documents(ref_docs: List[Path]) -> str:
+    """处理所有参考文档并合并内容"""
+    if not ref_docs:
+        return ""
+    
+    combined_content = "=== 参考文档内容 ===\n\n"
+    
+    for i, doc_path in enumerate(ref_docs, 1):
+        if not doc_path.exists():
+            combined_content += f"{i}. {doc_path.name}: 文件不存在\n\n"
+            continue
+            
+        ext = doc_path.suffix.lower()
+        combined_content += f"{i}. 文档: {doc_path.name}\n"
+        combined_content += "-" * 50 + "\n"
+        
+        if ext == '.pdf':
+            content = extract_pdf_content(doc_path)
+        elif ext == '.csv':
+            content = extract_csv_content(doc_path)
+        elif ext in ['.txt', '.md']:
+            content = extract_txt_content(doc_path)
+        elif ext == '.docx':
+            content = extract_docx_content(doc_path)
+        else:
+            content = f"不支持的文档类型: {ext}"
+        
+        combined_content += content + "\n\n"
+    
+    combined_content += "=== 参考文档结束 ===\n\n"
+    return combined_content
+
+
 
 # =========================
 # Defaults
@@ -337,9 +437,14 @@ def call_openai_compatible(
     json_mode: bool,
     timeout: int = DEFAULT_API_TIMEOUT,
     transport: str = "file",
+    reference_content: str = "",
 ) -> Dict[str, Any]:
     """Single entry for GLM/Qwen (OpenAI-compatible) backends."""
-    content = [{"type": "text", "text": user_prompt}] + [_image_part_from_path(p, transport) for p in images]
+    full_user_prompt = user_prompt
+    if reference_content.strip():
+        full_user_prompt = reference_content + "\n" + user_prompt
+
+    content = [{"type": "text", "text": full_user_prompt}] + [_image_part_from_path(p, transport) for p in images]
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [
@@ -372,7 +477,7 @@ class ProcessingTask:
     def __init__(self, idx: int, img_path: Path, file_subdir: Path, 
                  panels_info: List[Tuple[str, Path]], send_paths: List[Path], 
                  use_single_path: Optional[Path], ow: int, oh: int, iw: int, ih: int, 
-                 mae_value: float, user_prompt: str):
+                 mae_value: float, user_prompt: str, reference_content: str = ""):
         self.idx = idx
         self.img_path = img_path
         self.file_subdir = file_subdir
@@ -385,6 +490,7 @@ class ProcessingTask:
         self.ih = ih
         self.mae_value = mae_value
         self.user_prompt = user_prompt
+        self.reference_content = reference_content 
 
 # =========================
 # Worker function for concurrent processing
@@ -422,6 +528,7 @@ def process_single_image(
             max_tokens=max_tokens,
             json_mode=json_mode,
             transport=transport,
+            reference_content=task.reference_content,
         )
         if out.get("json") is not None:
             result = out
@@ -482,6 +589,7 @@ def _process_stream_concurrent(
     stream: Iterable[Path],
     total_files: int,
     tmp_root: Path,
+    reference_docs: List[Path] = None, 
     *,
     api_url: str,
     model: str,
@@ -508,6 +616,12 @@ def _process_stream_concurrent(
     max_workers: int,
 ) -> Tuple[int, int]:
     """Core concurrent processing loop."""
+
+    reference_content = ""
+    if reference_docs:
+        reference_content = process_reference_documents(reference_docs)
+        print(f"[INFO] Loaded {len(reference_docs)} reference document(s), total length: {len(reference_content)} chars")
+
     total_seen = 0
     total_emitted = 0
     
@@ -616,7 +730,8 @@ def _process_stream_concurrent(
                     # Create task
                     task = ProcessingTask(
                         idx, img_path, file_subdir, panels_info, send_paths, 
-                        use_single_path, ow, oh, iw, ih, mae_value, user_prompt
+                        use_single_path, ow, oh, iw, ih, mae_value, user_prompt,
+                        reference_content  
                     )
 
                     # Submit task to executor immediately
@@ -692,6 +807,15 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     
+    ap.add_argument("--reference-docs", type=str, nargs="+", default=None,
+                    help="参考文档路径列表，支持PDF、CSV、TXT、DOCX格式")
+    ap.add_argument("--max-doc-pages", type=int, default=50,
+                    help="PDF文档最大处理页数 (default: 50)")
+    ap.add_argument("--max-csv-rows", type=int, default=200,
+                    help="CSV文件最大显示行数 (default: 200)")
+    ap.add_argument("--max-txt-chars", type=int, default=10000,
+                    help="TXT文件最大字符数 (default: 10000)")
+
     # parallel
     ap.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                     help="Maximum number of concurrent API workers (default: 4)")
@@ -758,13 +882,23 @@ def main():
     if args.limit and args.limit > 0:
         stream = islice(stream, args.limit)
 
+    reference_docs = []
+    if args.reference_docs:
+        for doc_path in args.reference_docs:
+            path = Path(doc_path).expanduser().resolve()
+            if path.exists():
+                reference_docs.append(path)
+                print(f"[INFO] Added reference document: {path}")
+            else:
+                print(f"[WARN] Reference document not found: {path}")
+
     # Temp vs persistent artifacts dir
     if args.keep_panels_dir:
         tmp_root = Path(args.keep_panels_dir).expanduser().resolve()
         tmp_root.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using persistent dir: {tmp_root}")
         seen, emitted = _process_stream_concurrent(
-            stream, total_files, tmp_root,
+            stream, total_files, tmp_root, reference_docs,
             api_url=args.url, model=args.model, max_side=args.max_side, out_jsonl=out_path,
             temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens,
             max_bytes=args.max_bytes, max_pixels=args.max_pixels, detail=args.detail,
@@ -780,7 +914,7 @@ def main():
             tmp_root = Path(td)
             print(f"[INFO] Using temp dir: {tmp_root}")
             seen, emitted = _process_stream_concurrent(
-                stream, total_files, tmp_root,
+                stream, total_files, tmp_root, reference_docs, 
                 api_url=args.url, model=args.model, max_side=args.max_side, out_jsonl=out_path,
                 temperature=args.temperature, top_p=args.top_p, max_tokens=args.max_tokens,
                 max_bytes=args.max_bytes, max_pixels=args.max_pixels, detail=args.detail,
