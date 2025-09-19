@@ -24,6 +24,12 @@
 python Captions_All.py /path/to/images --out results.jsonl
 ```
 
+### 若需要在生成过程中参考文档等内容，可以按照下述参数生成caption
+```bash
+python Captions_All.py /path/to/images \
+    --reference-docs report.pdf data_specs.csv metadata.txt \
+```
+
 ### 自定义 API 服务器和模型
 ```bash
 python Captions_All.py /path/to/images --url http://localhost:8000/v1/chat/completions --model qwen2.5-vl-72b --out results.jsonl
